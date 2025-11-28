@@ -1,4 +1,4 @@
-#!/user/bin/env python
+#!/usr/bin/env python
 import copy
 import torch
 import random
@@ -117,10 +117,11 @@ def run_alg(args):
     elif model_name == 'Resnet8':
         if args.dataset == 'cifar10tpds':
             modelObj = Resnetwithoutcon_(option='resnet8',num_classes=10).to(args.device)
-        if args.dataset == 'tiny_ImageNet':
+            args.num_classes = 10
+        elif args.dataset == 'tiny_ImageNet':
             modelObj = Resnetwithoutcon_(option='resnet8',num_classes=200).to(args.device)
             args.num_classes = 200
-        if args.dataset == 'gpr_custom':
+        elif args.dataset == 'gpr_custom':
             modelObj = Resnetwithoutcon_(option='resnet8',num_classes=8).to(args.device)
             args.num_classes = 8
     elif model_name == 'Resnet18':
