@@ -1,0 +1,15 @@
+h5py
+tqdm
+scikit-learn
+numpy==1.26.4
+torch==2.0.1
+torchvision==0.15.2
+albumentations
+opencv-python==4.8.1.78
+timm
+tensorboardX
+thop
+scipy==1.11.4
+matplotlib==3.7.5
+seaborn
+scikit-learn

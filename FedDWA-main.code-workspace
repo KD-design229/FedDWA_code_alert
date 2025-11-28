@@ -1,0 +1,18 @@
+{
+	"folders": [
+		{
+			"name": "FedDWA-main",
+			"path": "."
+		},
+		{
+			"path": "../FedDecorr"
+		},
+		{
+			"path": "../FedVLS"
+		},
+		{
+			"path": "../../Downloads/results (33)/results"
+		}
+	],
+	"settings": {}
+}
