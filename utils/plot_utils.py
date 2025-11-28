@@ -47,7 +47,14 @@ def plot_training_results(log_dir='./logs_feddwa', save_path='./feddwa_analysis_
     rounds = range(1, len(weighted_mean_acc) + 1)
     
     # Setup plot
-    plt.style.use('seaborn-v0_8-whitegrid')
+    try:
+        plt.style.use('seaborn-v0_8-whitegrid')
+    except OSError:
+        # Fallback for older matplotlib versions
+        try:
+            plt.style.use('seaborn-whitegrid')
+        except OSError:
+            plt.style.use('default')
     fig, axes = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
     
     # 1. Global & Weighted Accuracy

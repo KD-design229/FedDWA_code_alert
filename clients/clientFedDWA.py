@@ -127,8 +127,10 @@ class clientFedDWA(ClientBase):
                  for _, y in self.train_loader:
                      targets.extend(y.cpu().numpy())
             present_classes = set(np.unique(targets))
-        except:
+        except Exception as e:
             # If all else fails, assume all classes are present (disable FedVLS effectively)
+            if self.logger:
+                self.logger.warning(f"Failed to detect present classes: {e}. Assuming all classes are present.")
             present_classes = set(range(self.num_classes))
             
         all_classes = set(range(self.num_classes))
@@ -195,7 +197,9 @@ class clientFedDWA(ClientBase):
                         try:
                             feat = self.model.forward_features(inputs)
                             features = self.model.forward_head(feat, pre_logits=True)
-                        except:
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.debug(f"Failed to extract features for FedDecorr: {e}")
                             features = None
                     
                     if features is not None:
@@ -233,7 +237,6 @@ class clientFedDWA(ClientBase):
                 loss.backward()
                 # optimize
                 self.optimizer.step()
-                # todo: save loss
                 loss_logs.append(loss.mean().item())
         # get the model parameters of the next round by training in advance
         for i in range(self.next_round):

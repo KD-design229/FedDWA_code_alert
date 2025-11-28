@@ -12,4 +12,3 @@ thop
 scipy==1.11.4
 matplotlib==3.7.5
 seaborn
-scikit-learn

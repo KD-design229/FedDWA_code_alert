@@ -192,7 +192,7 @@ class ServerBase(object):
         calclulate each client test acccuracy and then
         calclulate the weighted-mean accuracy
         """
-        if selected_all == True:
+        if selected_all:
             # test all clients
             acc_logs = []
             for idx in range(self.num_clients):
