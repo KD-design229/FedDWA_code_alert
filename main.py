@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument('--client_num', type=int, default=20, help='total client num')
     parser.add_argument('--client_frac', type=float, default=0.5, help='client fraction per round')
     parser.add_argument('--model', type=str, default='cnn', help='model type',
-                        choices=['cnn', 'Resnet18',  'Resnet8', 'mobilevit', 'mobilevit_s'])
+                        choices=['cnn', 'Resnet18',  'Resnet8', 'mobilevit', 'mobilevit_s', 'resnet18_timm', 'efficientnet_b0'])
     parser.add_argument('--E', type=int, default=1, help='local epoch number per client')
     parser.add_argument('--Tg', type=int, default=100, help='global communication round')
     parser.add_argument('--B', type=int, default=20, help='client local batch size ')
@@ -141,6 +141,40 @@ def run_alg(args):
         else:
              # 默认 fallback
             modelObj = MobileViT(model_name='mobilevit_s', num_classes=args.num_classes).to(args.device)
+    elif model_name == 'resnet18_timm':
+        # [Added] ResNet18 from timm for architecture comparison
+        import timm
+        if args.dataset == 'gpr_custom':
+            modelObj = timm.create_model('resnet18', pretrained=False, num_classes=8).to(args.device)
+            args.num_classes = 8
+        elif args.dataset == 'cifar10tpds' or args.dataset == 'cinic-10':
+            modelObj = timm.create_model('resnet18', pretrained=False, num_classes=10).to(args.device)
+            args.num_classes = 10
+        elif args.dataset == 'cifar100tpds':
+            modelObj = timm.create_model('resnet18', pretrained=False, num_classes=100).to(args.device)
+            args.num_classes = 100
+        elif args.dataset == 'tiny_ImageNet':
+            modelObj = timm.create_model('resnet18', pretrained=False, num_classes=200).to(args.device)
+            args.num_classes = 200
+        else:
+            modelObj = timm.create_model('resnet18', pretrained=False, num_classes=args.num_classes).to(args.device)
+    elif model_name == 'efficientnet_b0':
+        # [Added] EfficientNet-B0 from timm for lightweight architecture comparison
+        import timm
+        if args.dataset == 'gpr_custom':
+            modelObj = timm.create_model('tf_efficientnet_b0', pretrained=False, num_classes=8).to(args.device)
+            args.num_classes = 8
+        elif args.dataset == 'cifar10tpds' or args.dataset == 'cinic-10':
+            modelObj = timm.create_model('tf_efficientnet_b0', pretrained=False, num_classes=10).to(args.device)
+            args.num_classes = 10
+        elif args.dataset == 'cifar100tpds':
+            modelObj = timm.create_model('tf_efficientnet_b0', pretrained=False, num_classes=100).to(args.device)
+            args.num_classes = 100
+        elif args.dataset == 'tiny_ImageNet':
+            modelObj = timm.create_model('tf_efficientnet_b0', pretrained=False, num_classes=200).to(args.device)
+            args.num_classes = 200
+        else:
+            modelObj = timm.create_model('tf_efficientnet_b0', pretrained=False, num_classes=args.num_classes).to(args.device)
     else:
         raise NotImplementedError
 
