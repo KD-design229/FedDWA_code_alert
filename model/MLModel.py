@@ -1137,34 +1137,86 @@ class FedCLIP(nn.Module):
     def set_class_prompts(self, class_names):
         self.class_names = class_names
         
-        if self.gpr_mode:
-            # [优化] GPR 专用 prompt 模板集合 (Prompt Ensemble)
-            # 使用多种描述方式来增强模型对 GPR 图像特征的理解
-            templates = [
-                "a ground penetrating radar image showing {}",
-                "a GPR B-scan of {}",
-                "a radargram containing {}",
-                "subsurface detection of {}",
-                "a GPR profile with {}",
-                "a cross-sectional scan of {}",
-                "geophysical data showing {}",
+        # [自定义] GPR 类别描述映射表
+        # 为每个类别定义特定的视觉特征描述，增强 CLIP 的理解能力
+        custom_gpr_prompts = {
+            "Loose": [
+                "GPR signal of loose uncompacted soil",
+                "low density area in ground penetrating radar",
+                "scattered reflections indicating loose material",
+                "a region of low compaction in the subsurface"
+            ],
+            "Crack": [
+                "GPR B-scan showing a hyperbolic reflection from a crack",
+                "discontinuity in subsurface layers indicating a fracture",
+                "vertical crack signature in radargram",
+                "a break or fracture in the pavement structure"
+            ],
+            "Mud Pumping": [
+                "GPR signature of mud pumping under pavement",
+                "subsurface moisture and fine material accumulation",
+                "blurred reflection caused by mud pumping",
+                "structural deterioration due to water and soil pumping"
+            ],
+            "Pipeline": [
+                "hyperbolic reflection from a buried pipeline",
+                "GPR scan of an underground pipe",
+                "inverted U-shape reflection of a utility line",
+                "a cylindrical object buried underground"
+            ],
+            "Redar": [
+                "a specific radar anomaly",
+                "ground penetrating radar target",
+                "distinctive GPR reflection pattern",
+                "an identified radar signature"
+            ],
+            "stell_rib": [
+                "strong hyperbolic reflection from a steel rib",
+                "GPR image of metal reinforcement bar",
+                "regularly spaced high amplitude reflections from steel",
+                "metal object embedded in concrete or soil"
+            ],
+            "Void": [
+                "GPR image showing a subsurface void",
+                "signal ringing and polarity reversal indicating a cavity",
+                "empty space underground in radargram",
+                "an air-filled or water-filled hole beneath the surface"
+            ],
+            "Water Abnormality": [
+                "GPR signal attenuation caused by water saturation",
+                "high dielectric contrast area indicating water abnormality",
+                "subsurface water leakage signature",
+                "abnormal moisture content in the ground"
             ]
-        else:
-            # 通用图像模板集合
-            templates = [
-                "a picture of a {}",
-                "a photo of a {}",
-                "an image of a {}",
-                "a close-up photo of a {}",
-            ]
+        }
+
+        # [修正] 始终使用 Text Encoder，即使在 gpr_mode 下
+        # 这样可以利用 CLIP 强大的语义锚点能力，避免线性分类头在 Non-IID 下的漂移
+        
+        # [优化] GPR 专用 prompt 模板集合 (Prompt Ensemble)
+        # 使用多种描述方式来增强模型对 GPR 图像特征的理解
+        templates = [
+            "a ground penetrating radar image showing {}",
+            "a GPR B-scan of {}",
+            "a radargram containing {}",
+            "subsurface detection of {}",
+            "a GPR profile with {}",
+            "a cross-sectional scan of {}",
+            "geophysical data showing {}",
+        ]
             
         # 计算每个类别的平均文本特征
         all_text_features = []
         
         with torch.no_grad():
             for c in class_names:
-                # 为当前类别生成所有模板的 prompt
-                prompts = [template.format(c) for template in templates]
+                # 优先使用自定义描述，如果没有则使用模板生成
+                if c in custom_gpr_prompts:
+                    prompts = custom_gpr_prompts[c]
+                else:
+                    # 为当前类别生成所有模板的 prompt
+                    prompts = [template.format(c) for template in templates]
+                
                 text_tokens = clip.tokenize(prompts).to(self.device)
                 
                 # 编码并归一化
@@ -1187,10 +1239,24 @@ class FedCLIP(nn.Module):
         
         # Adapter
         if self.gpr_mode:
-            # GPR 模式：使用 GPRAdapter + 线性分类头
+            # [修正] GPR 模式下，我们仍然使用 Text Encoder 作为分类器
+            # 但是我们使用更强的 Adapter 来调整图像特征，使其更接近 GPR 的文本描述
+            
+            # 使用 GPRAdapter 调整图像特征
             adapted_features = self.fea_attn(image_features)
             adapted_features = adapted_features / adapted_features.norm(dim=1, keepdim=True)
-            logits = self.gpr_classifier(adapted_features)
+            
+            # [关键修正] 不再使用 gpr_classifier (线性头)，而是使用 Text Features
+            # 这样可以利用 CLIP 的 Zero-shot 能力作为强先验，防止过拟合
+            if self.text_features is None:
+                 if self.training:
+                     raise ValueError("Class prompts not set. Call set_class_prompts() first.")
+                 return torch.zeros(x.size(0), self.num_classes).to(self.device)
+            
+            # 计算图像特征与文本特征的相似度
+            logit_scale = self.model.logit_scale.exp().float()
+            logits = logit_scale * adapted_features @ self.text_features.t()
+            
         else:
             # 原始模式：使用 attention adapter + text similarity
             attn_weights = self.fea_attn(image_features)
@@ -1218,9 +1284,10 @@ class FedCLIP(nn.Module):
         with torch.no_grad():
             for param in self.fea_attn.parameters():
                 vals.append(copy.deepcopy(param))
-            if self.gpr_mode:
-                for param in self.gpr_classifier.parameters():
-                    vals.append(copy.deepcopy(param))
+            # [修正] gpr_classifier 不再使用，所以不需要获取它的参数
+            # if self.gpr_mode:
+            #     for param in self.gpr_classifier.parameters():
+            #         vals.append(copy.deepcopy(param))
         return vals
         
     def set_head_val(self, vals):
@@ -1229,10 +1296,11 @@ class FedCLIP(nn.Module):
             for param in self.fea_attn.parameters():
                 param.copy_(vals[i])
                 i += 1
-            if self.gpr_mode:
-                for param in self.gpr_classifier.parameters():
-                    param.copy_(vals[i])
-                    i += 1
+            # [修正] gpr_classifier 不再使用
+            # if self.gpr_mode:
+            #     for param in self.gpr_classifier.parameters():
+            #         param.copy_(vals[i])
+            #         i += 1
                 
     def get_body_val(self):
         # Body is frozen
