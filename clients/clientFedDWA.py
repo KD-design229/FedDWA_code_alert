@@ -4,6 +4,7 @@ import numpy as np
 import time
 import copy
 from clients.clientBase import ClientBase
+from utils.ALA import ALA
 
 
 class clientFedDWA(ClientBase):
@@ -12,9 +13,20 @@ class clientFedDWA(ClientBase):
         super(clientFedDWA, self).__init__(args, id, modelObj, train_set, test_set, **kwargs)
 
         self.loss_fn = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.0)
+        # [优化] 添加 weight decay 支持
+        weight_decay = getattr(args, 'weight_decay', 0.0)
+        self.optimizer = torch.optim.SGD(
+            self.model.parameters(), 
+            lr=self.lr, 
+            momentum=0.0,
+            weight_decay=weight_decay  # L2 正则化
+        )
         self.next_step_model = None
         self.next_round = args.next_round
+        
+        # [Added] Initialize ALA
+        self.ALA = ALA(self.id, self.loss_fn, self.train_set, args.B, 
+                       args.rand_percent, args.layer_idx, args.eta, self.device)
 
 
     def train_one_step(self,):
@@ -36,7 +48,8 @@ class clientFedDWA(ClientBase):
                 loss = self.loss_fn(outputs, labels)
                 loss.backward()
                 self.optimizer.step()
-        self.next_step_model = {key: copy.deepcopy(value) for key, value in self.model.named_parameters()}
+        # [Modified] Only save trainable parameters for efficiency
+        self.next_step_model = {key: copy.deepcopy(value) for key, value in self.model.named_parameters() if value.requires_grad}
         # restore the old model
         self.model.load_state_dict(old_model)
 
@@ -94,15 +107,23 @@ class clientFedDWA(ClientBase):
         return np.array(all_labels), np.array(all_preds)
 
 
-    def receive_models(self, new_state):
+    def receive_models(self, new_model):
         """
-        Rewrite the receive_models method, because the new_state is come from
-        model.named_parameters()  instead of model.state_dict()
+        Override receive_models to use ALA.
+        
+        CRITICAL FOR PFL:
+        Instead of blindly overwriting the local model with the received model (new_model),
+        we use Adaptive Local Aggregation (ALA).
+        ALA learns a weight to merge the received model into the local model, ensuring
+        that the local model is INSENSITIVE to potentially harmful global/neighbor parameters.
         """
-        current_state = self.model.state_dict()
-        for name,value in new_state.items():
-            current_state[name] = value
-        self.model.load_state_dict(current_state)
+        # [Modified] Use ALA to adaptively aggregate global model
+        # This replaces the simple copy/overwrite in ClientBase
+        self.ALA.adaptive_local_aggregation(new_model, self.model)
+
+        # Update W_old (starting point for this round)
+        model_parameter = {key: value for key, value in self.model.named_parameters()}
+        self.W_old = copy.deepcopy(model_parameter)
 
     def train(self):
         start_time = time.time()

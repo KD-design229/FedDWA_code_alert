@@ -922,8 +922,36 @@ def get_mobilenet(num_classes):
     return model
 
 class MobileViT(nn.Module):
-    def __init__(self, model_name='mobilevit_s', num_classes=10, pretrained=True):
+    """
+    MobileViT 模型封装
+    
+    GPR 适配：
+    - 可选的 GPR 预处理层（信号归一化 + 时空特征增强）
+    - 支持冻结 backbone 只训练分类头
+    """
+    def __init__(self, model_name='mobilevit_s', num_classes=10, pretrained=True, gpr_mode=False):
         super(MobileViT, self).__init__()
+        
+        self.gpr_mode = gpr_mode
+        
+        # GPR 专用预处理层
+        if gpr_mode:
+            self.gpr_preprocess = nn.Sequential(
+                # 可学习的信号归一化
+                nn.InstanceNorm2d(3, affine=True),
+                # 时间域增强（垂直方向）
+                nn.Conv2d(3, 16, kernel_size=(5, 1), padding=(2, 0), bias=False),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                # 空间域增强（水平方向）
+                nn.Conv2d(16, 16, kernel_size=(1, 5), padding=(0, 2), bias=False),
+                nn.BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                # 融合回 3 通道
+                nn.Conv2d(16, 3, kernel_size=1, bias=False),
+                nn.BatchNorm2d(3),
+            )
+        
         self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
         
         # FedDWA 需要分离 head 和 body
@@ -949,6 +977,8 @@ class MobileViT(nn.Module):
             self.body = children[:-1]
 
     def forward(self, x):
+        if self.gpr_mode:
+            x = self.gpr_preprocess(x)
         return self.model(x)
 
     def get_head_val(self):
@@ -982,3 +1012,471 @@ class MobileViT(nn.Module):
                 for param in bn.parameters():
                     param.copy_(vals[i])
                     i += 1
+
+try:
+    import clip
+except ImportError:
+    clip = None
+
+class MaskedMLP(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(MaskedMLP, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.mask = nn.Parameter(torch.ones(out_features, in_features))
+        
+    def forward(self, x):
+        return F.linear(x, self.mask * self.linear.weight, self.linear.bias)
+
+
+class GPRAdapter(nn.Module):
+    """
+    GPR 专用 Adapter 模块
+    针对探地雷达信号特点设计的轻量级适配器
+    """
+    def __init__(self, dim, reduction=4):
+        super(GPRAdapter, self).__init__()
+        hidden_dim = dim // reduction
+        
+        # 下投影
+        self.down_proj = nn.Linear(dim, hidden_dim)
+        # 非线性激活
+        self.act = nn.GELU()
+        # 上投影
+        self.up_proj = nn.Linear(hidden_dim, dim)
+        # 可学习的缩放因子（控制 adapter 的影响程度）
+        self.scale = nn.Parameter(torch.ones(1) * 0.1)
+        
+        # 初始化为近似恒等映射
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
+        
+    def forward(self, x):
+        # 残差连接 + adapter
+        return x + self.scale * self.up_proj(self.act(self.down_proj(x)))
+
+
+class FedCLIP(nn.Module):
+    """
+    FedCLIP: 冻结 CLIP backbone + 可训练 Adapter
+    
+    GPR 适配：
+    - gpr_mode=True 时使用 GPR 专用 Adapter
+    - GPR 专用的 prompt 模板
+    """
+    def __init__(self, model_name='ViT-B/32', device='cuda', num_classes=10, class_names=None, gpr_mode=False):
+        super(FedCLIP, self).__init__()
+        if clip is None:
+            raise ImportError("Please install clip: pip install git+https://github.com/openai/CLIP.git")
+            
+        self.device = device
+        self.gpr_mode = gpr_mode
+        
+        # Load CLIP model
+        # jit=False is often recommended for fine-tuning or when using with other torch modules
+        self.model, self.preprocess = clip.load(model_name, device=device, jit=False)
+        self.model.eval() # Freeze CLIP by default
+        
+        # Freeze parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # Attention Adapter (from FedMedCLIP)
+        # CLIP visual output dim: 512 for ViT-B/32, 768 for ViT-L/14
+        if model_name == 'ViT-B/32':
+            dim = 512
+        elif model_name == 'ViT-L/14':
+            dim = 768
+        else:
+            # Infer dim from a dummy run
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, 224, 224).to(device)
+                dim = self.model.encode_image(dummy).shape[1]
+
+        self.dim = dim
+        
+        if gpr_mode:
+            # [优化] GPR 专用 Adapter：更深的结构 + 强正则化防止过拟合
+            self.fea_attn = nn.Sequential(
+                GPRAdapter(dim, reduction=4),  # 第一层 adapter
+                nn.LayerNorm(dim),
+                nn.Dropout(0.2),  # [新增] Dropout 防止过拟合
+                GPRAdapter(dim, reduction=4),  # 第二层 adapter
+                nn.LayerNorm(dim),
+                nn.Dropout(0.2),  # [新增] Dropout
+            )
+            # [优化] GPR 专用分类头：增加深度 + 更强正则化
+            self.gpr_classifier = nn.Sequential(
+                nn.Linear(dim, dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.3),  # [调整] 提高 Dropout 比例
+                nn.Linear(dim // 2, dim // 4),  # [新增] 增加一层
+                nn.ReLU(),
+                nn.Dropout(0.2),  # [新增]
+                nn.Linear(dim // 4, num_classes),
+            )
+        else:
+            # [优化] 原始 Attention Adapter + 正则化
+            self.fea_attn = nn.Sequential(
+                MaskedMLP(dim, dim),
+                nn.BatchNorm1d(dim),
+                nn.Dropout(0.2),  # [新增] 防止过拟合
+                nn.ReLU(),
+                MaskedMLP(dim, dim),
+                nn.Dropout(0.2),  # [新增]
+                nn.Softmax(dim=1)
+            )
+        
+        self.class_names = class_names
+        self.text_features = None
+        self.num_classes = num_classes
+        
+        # Initialize text features if class names are provided
+        if self.class_names:
+            self.set_class_prompts(self.class_names)
+            
+    def set_class_prompts(self, class_names):
+        self.class_names = class_names
+        
+        if self.gpr_mode:
+            # [优化] GPR 专用 prompt 模板集合 (Prompt Ensemble)
+            # 使用多种描述方式来增强模型对 GPR 图像特征的理解
+            templates = [
+                "a ground penetrating radar image showing {}",
+                "a GPR B-scan of {}",
+                "a radargram containing {}",
+                "subsurface detection of {}",
+                "a GPR profile with {}",
+                "a cross-sectional scan of {}",
+                "geophysical data showing {}",
+            ]
+        else:
+            # 通用图像模板集合
+            templates = [
+                "a picture of a {}",
+                "a photo of a {}",
+                "an image of a {}",
+                "a close-up photo of a {}",
+            ]
+            
+        # 计算每个类别的平均文本特征
+        all_text_features = []
+        
+        with torch.no_grad():
+            for c in class_names:
+                # 为当前类别生成所有模板的 prompt
+                prompts = [template.format(c) for template in templates]
+                text_tokens = clip.tokenize(prompts).to(self.device)
+                
+                # 编码并归一化
+                class_embeddings = self.model.encode_text(text_tokens)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=1, keepdim=True)
+                
+                # 平均所有模板的特征 (Prompt Ensembling)
+                mean_embedding = class_embeddings.mean(dim=0)
+                mean_embedding = mean_embedding / mean_embedding.norm() # 再次归一化
+                
+                all_text_features.append(mean_embedding)
+            
+            # 堆叠所有类别的特征 [num_classes, feature_dim]
+            # [Fix] Convert to float32 to match image_features in forward pass
+            self.text_features = torch.stack(all_text_features).float()
+            
+    def forward(self, x):
+        # Image encoding
+        image_features = self.model.encode_image(x).float()
+        
+        # Adapter
+        if self.gpr_mode:
+            # GPR 模式：使用 GPRAdapter + 线性分类头
+            adapted_features = self.fea_attn(image_features)
+            adapted_features = adapted_features / adapted_features.norm(dim=1, keepdim=True)
+            logits = self.gpr_classifier(adapted_features)
+        else:
+            # 原始模式：使用 attention adapter + text similarity
+            attn_weights = self.fea_attn(image_features)
+            image_features = torch.mul(attn_weights, image_features)
+            image_features = image_features / image_features.norm(dim=1, keepdim=True)
+            
+            # Classification (Similarity with text features)
+            if self.text_features is None:
+                 # If no text features, we can't classify. 
+                 # For now, raise error or return dummy if just initializing
+                 if self.training:
+                     raise ValueError("Class prompts not set. Call set_class_prompts() first.")
+                 return torch.zeros(x.size(0), self.num_classes).to(self.device)
+                 
+            # [Fix] Convert logit_scale to float32
+            logit_scale = self.model.logit_scale.exp().float()
+            logits = logit_scale * image_features @ self.text_features.t()
+        
+        return logits
+        
+    # FedDWA interfaces
+    def get_head_val(self):
+        # For FedCLIP, the "head" is the adapter we are training
+        vals = []
+        with torch.no_grad():
+            for param in self.fea_attn.parameters():
+                vals.append(copy.deepcopy(param))
+            if self.gpr_mode:
+                for param in self.gpr_classifier.parameters():
+                    vals.append(copy.deepcopy(param))
+        return vals
+        
+    def set_head_val(self, vals):
+        i = 0
+        with torch.no_grad():
+            for param in self.fea_attn.parameters():
+                param.copy_(vals[i])
+                i += 1
+            if self.gpr_mode:
+                for param in self.gpr_classifier.parameters():
+                    param.copy_(vals[i])
+                    i += 1
+                
+    def get_body_val(self):
+        # Body is frozen
+        return []
+
+    def set_body_val(self, vals):
+        pass
+
+
+# ============================================================================
+# GPR-FedSense: 专为探地雷达数据设计的联邦学习架构
+# ============================================================================
+
+class GPRSignalNorm(nn.Module):
+    """
+    GPR 信号归一化层
+    可学习的归一化参数，适配不同设备/环境的信号特性
+    """
+    def __init__(self, num_features):
+        super(GPRSignalNorm, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(1, num_features, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, num_features, 1, 1))
+        # 可学习的信号增益校正
+        self.gain = nn.Parameter(torch.ones(1))
+        
+    def forward(self, x):
+        # 实例归一化 (适配单样本的设备差异)
+        mean = x.mean(dim=[2, 3], keepdim=True)
+        std = x.std(dim=[2, 3], keepdim=True) + 1e-5
+        x = (x - mean) / std
+        x = x * self.gamma + self.beta
+        x = x * self.gain
+        return x
+
+
+class GPRFeatureExtractor(nn.Module):
+    """
+    GPR 专用特征提取器
+    结合 1D（时间域）和 2D（空间域）卷积，捕获 GPR 信号的时频特征
+    
+    设计理念：
+    - 浅层：1D 卷积提取时间域反射特征
+    - 中层：2D 卷积提取空间结构特征
+    - 深层：混合注意力增强关键区域
+    """
+    def __init__(self, in_channels=3, base_dim=64):
+        super(GPRFeatureExtractor, self).__init__()
+        
+        # 可学习的信号归一化（适配不同设备）
+        self.signal_norm = GPRSignalNorm(in_channels)
+        
+        # Stage 1: 浅层特征（捕获边缘和纹理）
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_dim),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Stage 2: 时间域特征（垂直方向卷积，捕获深度反射）
+        self.time_conv = nn.Sequential(
+            nn.Conv2d(base_dim, base_dim, kernel_size=(5, 1), padding=(2, 0), bias=False),
+            nn.BatchNorm2d(base_dim),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Stage 3: 空间域特征（水平方向卷积，捕获横向延续性）
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(base_dim, base_dim, kernel_size=(1, 5), padding=(0, 2), bias=False),
+            nn.BatchNorm2d(base_dim),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 特征融合
+        self.fusion = nn.Sequential(
+            nn.Conv2d(base_dim * 2, base_dim * 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(base_dim * 2),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 输出维度
+        self.out_channels = base_dim * 2
+        
+    def forward(self, x):
+        # 信号归一化
+        x = self.signal_norm(x)
+        
+        # Stage 1
+        x = self.stage1(x)
+        
+        # 并行的时间/空间特征提取
+        time_feat = self.time_conv(x)
+        spatial_feat = self.spatial_conv(x)
+        
+        # 特征融合
+        x = torch.cat([time_feat, spatial_feat], dim=1)
+        x = self.fusion(x)
+        
+        return x
+
+
+class GPRFedModel(nn.Module):
+    """
+    GPR-FedSense: 探地雷达联邦学习专用模型
+    
+    架构特点：
+    1. 本地私有层：GPR 信号归一化 + 特征提取（适配不同设备/环境）
+    2. 全局共享层：深层特征提取（跨客户端知识共享）
+    3. 个性化分类头：ALA 自适应聚合（处理 Non-IID）
+    
+    Args:
+        num_classes: 分类类别数
+        base_dim: 基础通道数
+        backbone: 共享层 backbone 类型 ('cnn', 'resnet18', 'mobilevit')
+        pretrained: 是否使用预训练权重
+    """
+    def __init__(self, num_classes=8, base_dim=64, backbone='cnn', pretrained=True, image_size=224):
+        super(GPRFedModel, self).__init__()
+        
+        self.num_classes = num_classes
+        self.backbone_type = backbone
+        
+        # ============ 模块 1: GPR 本地特征提取器 (私有，不聚合) ============
+        self.local_extractor = GPRFeatureExtractor(in_channels=3, base_dim=base_dim)
+        local_out_dim = self.local_extractor.out_channels  # 128
+        
+        # ============ 模块 2: 共享 Backbone (全局聚合) ============
+        if backbone == 'cnn':
+            self.shared_backbone = nn.Sequential(
+                nn.Conv2d(local_out_dim, 256, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            feature_dim = 512
+            
+        elif backbone == 'resnet18':
+            # 使用 ResNet18，但替换第一层以接收 local_extractor 的输出
+            resnet = models.resnet18(pretrained=pretrained)
+            resnet.conv1 = nn.Conv2d(local_out_dim, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            # 移除原始的 fc 层
+            self.shared_backbone = nn.Sequential(*list(resnet.children())[:-1])
+            feature_dim = 512
+            
+        elif backbone == 'mobilevit':
+            # 使用 MobileViT，但需要适配输入通道
+            self.adapter_conv = nn.Conv2d(local_out_dim, 3, kernel_size=1)  # 转换回 3 通道
+            self.shared_backbone = timm.create_model('mobilevitv2_050', pretrained=pretrained, num_classes=0)
+            feature_dim = self.shared_backbone.num_features
+            
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+            
+        self.feature_dim = feature_dim
+        
+        # ============ 模块 3: 个性化分类头 (本地微调 + ALA) ============
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_classes),
+        )
+        
+        # 用于 FedDecorr 的特征输出钩子
+        self.features = None
+        
+    def forward(self, x, return_features=False):
+        # 本地特征提取
+        x = self.local_extractor(x)
+        
+        # 共享 backbone
+        if self.backbone_type == 'mobilevit':
+            x = self.adapter_conv(x)
+        x = self.shared_backbone(x)
+        
+        # 展平
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+            
+        # 保存特征用于 FedDecorr
+        self.features = x
+        
+        # 分类
+        out = self.classifier(x)
+        
+        if return_features:
+            return out, x
+        return out
+    
+    def get_features(self):
+        """获取最后一层特征，用于 FedDecorr"""
+        return self.features
+    
+    # ============ FedDWA 接口 ============
+    def get_head_val(self):
+        """获取分类头参数（用于个性化聚合）"""
+        vals = []
+        with torch.no_grad():
+            for param in self.classifier.parameters():
+                vals.append(copy.deepcopy(param))
+        return vals
+    
+    def set_head_val(self, vals):
+        """设置分类头参数"""
+        i = 0
+        with torch.no_grad():
+            for param in self.classifier.parameters():
+                param.copy_(vals[i])
+                i += 1
+                
+    def get_body_val(self):
+        """获取共享层参数（用于全局聚合）"""
+        vals = []
+        with torch.no_grad():
+            for param in self.shared_backbone.parameters():
+                vals.append(copy.deepcopy(param))
+        return vals
+    
+    def set_body_val(self, vals):
+        """设置共享层参数"""
+        i = 0
+        with torch.no_grad():
+            for param in self.shared_backbone.parameters():
+                param.copy_(vals[i])
+                i += 1
+                
+    def get_local_val(self):
+        """获取本地私有层参数（不参与聚合）"""
+        vals = []
+        with torch.no_grad():
+            for param in self.local_extractor.parameters():
+                vals.append(copy.deepcopy(param))
+        return vals
+    
+    def set_local_val(self, vals):
+        """设置本地私有层参数"""
+        i = 0
+        with torch.no_grad():
+            for param in self.local_extractor.parameters():
+                param.copy_(vals[i])
+                i += 1

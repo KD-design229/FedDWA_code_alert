@@ -69,6 +69,7 @@ class ServerBase(object):
         self.client_train_loss_logs = []
         self.client_mean_test_acc_logs = []
         self.global_acc_logs = []
+        self.global_train_acc_logs = []
         self.round_duration_logs = []
         self.selected_clients_logs = []
 
@@ -80,12 +81,33 @@ class ServerBase(object):
         # MobileViT 建议使用 256x256
         if self.model_name == 'cnn':
             resize = 32
-        elif self.model_name == 'mobilevit' or self.model_name == 'mobilevit_s':
+        elif self.model_name == 'mobilevit' or self.model_name == 'mobilevit_s' or self.model_name == 'fedclip':
             resize = 224
         else:
             resize = 224
             
         self.train_set, self.test_set = load_dataset(self.dataset_name, self.sample_rate, self.args.data_dir, resize=resize)
+        
+        # [Added] Set class prompts for FedCLIP
+        if self.model_name == 'fedclip':
+            class_names = None
+            # Try to get class names from dataset
+            if hasattr(self.train_set, 'classes'):
+                class_names = self.train_set.classes
+            elif hasattr(self.train_set, 'dataset') and hasattr(self.train_set.dataset, 'classes'):
+                class_names = self.train_set.dataset.classes
+            
+            if class_names:
+                self.logger.info(f"Setting FedCLIP class prompts: {class_names}")
+                self.global_model.set_class_prompts(class_names)
+            else:
+                # Fallback for CIFAR10
+                if self.dataset_name == 'cifar10tpds':
+                    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+                    self.global_model.set_class_prompts(class_names)
+                else:
+                    self.logger.warning("Could not find class names for FedCLIP prompts. Please ensure dataset has .classes attribute.")
+
         self.test_loader = DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False)
         if self.noniidtype == 8:
             noniid_fn = noniid_type8
@@ -248,11 +270,15 @@ class ServerBase(object):
             rounds = range(1, len(self.client_mean_test_acc_logs) + 1)
             
             with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['Round', 'Global_Acc', 'Weighted_Mean_Acc', 'Round_Duration', 'Learning_Rate', 'Selected_Clients']
+                # base fields
+                fieldnames = ['Round', 'Global_Acc', 'Global_Train_Acc',
+                              'Weighted_Mean_Acc', 'Round_Duration', 'Learning_Rate', 'Selected_Clients']
+
                 # Add client specific columns dynamically
                 num_clients = len(self.client_test_acc_logs[0]) if self.client_test_acc_logs else 0
                 for i in range(num_clients):
                     fieldnames.append(f'Client_{i}_Test_Acc')
+                    fieldnames.append(f'Client_{i}_Train_Acc')
                     fieldnames.append(f'Client_{i}_Train_Loss')
                 
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -262,6 +288,7 @@ class ServerBase(object):
                     row = {
                         'Round': r,
                         'Global_Acc': self.global_acc_logs[i] if i < len(self.global_acc_logs) else None,
+                        'Global_Train_Acc': self.global_train_acc_logs[i] if i < len(self.global_train_acc_logs) else None,
                         'Weighted_Mean_Acc': self.client_mean_test_acc_logs[i],
                         'Round_Duration': self.round_duration_logs[i] if i < len(self.round_duration_logs) else None,
                         'Learning_Rate': self.learning_rate,
@@ -271,6 +298,9 @@ class ServerBase(object):
                     if self.client_test_acc_logs and i < len(self.client_test_acc_logs):
                         for client_idx, acc in enumerate(self.client_test_acc_logs[i]):
                             row[f'Client_{client_idx}_Test_Acc'] = acc
+                    if self.client_train_acc_logs and i < len(self.client_train_acc_logs):
+                        for client_idx, train_acc in enumerate(self.client_train_acc_logs[i]):
+                            row[f'Client_{client_idx}_Train_Acc'] = train_acc
                             
                     if self.client_train_loss_logs and i < len(self.client_train_loss_logs):
                         for client_idx, loss in enumerate(self.client_train_loss_logs[i]):

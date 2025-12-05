@@ -145,8 +145,12 @@ def load_custom_dataset(data_dir, sample_rate=1.0, resize=32):
     # image_size 现在由参数控制
     image_size = resize 
     
-    train_transform = get_gpr_transforms(is_train=True, image_size=image_size)
-    test_transform = get_gpr_transforms(is_train=False, image_size=image_size)
+    # [Modified] 如果尺寸是 224 (通常用于 CLIP/ViT/ResNet 等预训练模型)，建议使用 ImageNet/CLIP 的归一化参数
+    # 否则使用 GPR 数据集原本计算的统计值
+    use_clip_norm = (image_size == 224)
+    
+    train_transform = get_gpr_transforms(is_train=True, image_size=image_size, use_clip_norm=use_clip_norm)
+    test_transform = get_gpr_transforms(is_train=False, image_size=image_size, use_clip_norm=use_clip_norm)
 
     train_dir = os.path.join(data_dir, 'train')
     test_dir = os.path.join(data_dir, 'test')
@@ -259,24 +263,41 @@ class GPR_ImageFolder(datasets.ImageFolder):
 
         return image, target
 
-def get_gpr_transforms(is_train=True, image_size=32):
+def get_gpr_transforms(is_train=True, image_size=32, use_clip_norm=False, enable_advanced_gpr=True):
     """
     参考用户提供的 Notebook 实现的数据增强策略 (aug_methon == 1)
+    
+    Args:
+        is_train: 是否为训练模式
+        image_size: 图像尺寸
+        use_clip_norm: 是否使用 CLIP 归一化参数
+        enable_advanced_gpr: 是否启用 GPR 高级增强（时频域模拟）
     """
-    # Mean (RGB): [0.49715162577510535, 0.49943902106757904, 0.5020123172567167]
-    # Std  (RGB): [0.15914664258290495, 0.15962691844790716, 0.15891394991650823]
-    mean = [0.49715162577510535, 0.49943902106757904, 0.5020123172567167]
-    std = [0.15914664258290495, 0.15962691844790716, 0.15891394991650823]
+    if use_clip_norm:
+        # CLIP / ImageNet 标准归一化参数
+        # OpenAI CLIP: mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
+        # Torchvision: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        # 这里使用 OpenAI CLIP 的参数，因为我们用的是 CLIP 模型
+        mean = [0.48145466, 0.4578275, 0.40821073]
+        std = [0.26862954, 0.26130258, 0.27577711]
+        # print(f"Using CLIP normalization for image_size={image_size}")
+    else:
+        # GPR 数据集自定义统计值
+        # Mean (RGB): [0.49715162577510535, 0.49943902106757904, 0.5020123172567167]
+        # Std  (RGB): [0.15914664258290495, 0.15962691844790716, 0.15891394991650823]
+        mean = [0.49715162577510535, 0.49943902106757904, 0.5020123172567167]
+        std = [0.15914664258290495, 0.15962691844790716, 0.15891394991650823]
 
     if is_train:
-        return A.Compose([
+        # GPR 数据增强策略列表
+        transforms_list = [
             # --- 尺寸与几何变换 ---
             # 步骤 1: 使用 RandomResizedCrop 替代原来的固定缩放和中心裁剪。
             # (这里为了保持一致性，使用 LongestMaxSize + PadIfNeeded，对应 notebook 中的逻辑)
             A.LongestMaxSize(max_size=image_size, p=1.0),
             A.PadIfNeeded(min_height=image_size, min_width=image_size, border_mode=0, value=134, p=1.0),
 
-            # 步骤 2: 水平翻转
+            # 步骤 2: 水平翻转（GPR 扫描线方向可以翻转）
             A.HorizontalFlip(p=0.5),
 
             # 步骤 3: 弹性变换，模拟地下介质不均匀导致的波形轻微扭曲
@@ -284,18 +305,31 @@ def get_gpr_transforms(is_train=True, image_size=32):
             A.ShiftScaleRotate(
                 shift_limit=0.05,      # 轻微平移 (±5%)
                 scale_limit=0.1,       # 轻微缩放 (±10%)
-                rotate_limit=0,        # ❌ GPR数据不应旋转!
+                rotate_limit=0,        # ❌ GPR数据不应旋转! (深度-时间轴有物理意义)
                 border_mode=0,         # 黑色填充
                 p=0.3                  # 降低概率
             ),
-            
+        ]
+        
+        # 高级 GPR 增强（模拟现场环境变化）
+        if enable_advanced_gpr:
+            transforms_list.extend([
+                # 模拟天线耦合变化（信号强度衰减）
+                A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+                
+                # 模拟不同土质的介电常数变化（对比度）
+                A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+            ])
+        
+        # 继续添加通用增强
+        transforms_list.extend([
             # --- 噪声与遮挡组合 ---
-            # 步骤 4: 使用 SomeOf 组合器 (notebook 中是 OneOf)
+            # 步骤 4: 使用 OneOf 组合器模拟不同类型的现场干扰
             A.OneOf([
-                # 选项1: 高斯噪声
+                # 选项1: 高斯噪声（电磁干扰）
                 A.GaussNoise(var_limit=(5.0, 30.0), p=1.0),
                 
-                # 选项2: 小范围随机遮挡
+                # 选项2: 小范围随机遮挡（信号缺失/饱和）
                 A.CoarseDropout(
                     max_holes=4,
                     max_height=15,
@@ -305,12 +339,12 @@ def get_gpr_transforms(is_train=True, image_size=32):
                     p=1.0
                 ),
                 
-                # 选项3: 乘性噪声
+                # 选项3: 乘性噪声（增益波动）
                 A.MultiplicativeNoise(multiplier=[0.9, 1.1], p=1.0),
             ], p=0.4),
 
             # --- 信号强度与颜色变换 ---
-            # 步骤 5: 随机调整亮度和对比度
+            # 步骤 5: 随机调整亮度和对比度（模拟不同深度的信号衰减）
             A.RandomBrightnessContrast(
                 brightness_limit=0.15,
                 contrast_limit=0.15, 
@@ -321,6 +355,8 @@ def get_gpr_transforms(is_train=True, image_size=32):
             A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ])
+        
+        return A.Compose(transforms_list)
     else:
         return A.Compose([
             A.LongestMaxSize(max_size=image_size, p=1.0),

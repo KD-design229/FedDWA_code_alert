@@ -86,6 +86,21 @@ class ClientBase(object):
         # save acc
         return acc
 
+    def train_accuracy(self):
+        """compute accuracy using train set"""
+        correct = 0
+        total = 0
+        self.model.eval()
+        with torch.no_grad():
+            for data in self.train_loader:
+                inputs, labels = data[0].to(self.device), data[1].to(self.device)
+                outputs = self.model(inputs)
+                _, predicts = torch.max(outputs, 1)
+                correct += (predicts == labels).sum().item()
+                total += len(labels)
+        acc = correct / total if total > 0 else 0.0
+        return acc
+
     def cal_model_variation_(self, target, subtrahend):
         """
         target = current model parameter - subtrahend, noted that they are all dictionary with tensor value

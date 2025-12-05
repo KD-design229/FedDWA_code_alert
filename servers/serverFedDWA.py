@@ -13,7 +13,8 @@ class FedDWA(ServerBase):
     def __init__(self, args, modelObj, run_times,logger):
         super(FedDWA, self).__init__(args, modelObj, run_times,logger)
         self.dataset_division()
-        self.set_clients(args, modelObj, clientFedDWA)
+        # [Fix] Pass self.global_model instead of modelObj to ensure clients get the updated model (with class prompts)
+        self.set_clients(args, self.global_model, clientFedDWA)
         # the initial send model for each client is the same
         self.send_client_models = None
         self.receive_client_next_models = []
@@ -37,7 +38,8 @@ class FedDWA(ServerBase):
         since in FedDWA, we need to receive two models for each client
         """
         assert (len(self.selected_clients_idx) > 0)
-        self.receive_client_models = [{key: value for key, value in self.clientsObj[idx].model.named_parameters()} for idx in self.selected_clients_idx]
+        # [Modified] Only aggregate parameters that require gradients (for efficiency with FedCLIP)
+        self.receive_client_models = [{key: value for key, value in self.clientsObj[idx].model.named_parameters() if value.requires_grad} for idx in self.selected_clients_idx]
         self.receive_client_datasize = np.array([self.clientsObj[idx].test_datasize for idx in self.selected_clients_idx])
         self.receive_client_weight = self.receive_client_datasize / self.receive_client_datasize.sum()
         self.receive_client_next_models = [self.clientsObj[idx].next_step_model for idx in self.selected_clients_idx]
@@ -170,14 +172,25 @@ class FedDWA(ServerBase):
         # [Fix] Update global model for evaluation
         # Use simple FedAvg for the global model (weighted average of client models)
         total_weight = sum(self.receive_client_datasize)
-        for param in self.global_model.parameters():
-            param.data.zero_()
+        
+        # Create a dict for global model parameters for easy access
+        global_model_params = dict(self.global_model.named_parameters())
+        
+        # Identify trainable parameters (keys from the first client model)
+        if len(self.receive_client_models) > 0:
+            trainable_keys = self.receive_client_models[0].keys()
             
-        for client_model, size in zip(self.receive_client_models, self.receive_client_datasize):
-            weight = size / total_weight
-            # client_model is a dict (state_dict), not a model object
-            for global_param, client_param_data in zip(self.global_model.parameters(), client_model.values()):
-                global_param.data += client_param_data.clone() * weight
+            # Zero out ONLY the trainable parameters in global model before aggregation
+            for name in trainable_keys:
+                if name in global_model_params:
+                    global_model_params[name].data.zero_()
+            
+            # Aggregate
+            for client_model, size in zip(self.receive_client_models, self.receive_client_datasize):
+                weight = size / total_weight
+                for name, client_param_data in client_model.items():
+                    if name in global_model_params:
+                        global_model_params[name].data += client_param_data.clone() * weight
 
     def train(self):
 
@@ -195,13 +208,25 @@ class FedDWA(ServerBase):
                 # [Added] Test global accuracy
                 global_acc = self.test_global_data()
                 self.global_acc_logs.append(global_acc)
+                
+                # [Added] Approximate global train accuracy as average of participating clients' train acc
+                if self.client_train_acc_logs:
+                    last_train_accs = self.client_train_acc_logs[-1]
+                    if len(last_train_accs) > 0:
+                        global_train_acc = float(np.mean(last_train_accs))
+                        self.global_train_acc_logs.append(global_train_acc)
 
             t1 = time.time()
             loss_logs = []
+            train_acc_logs = []
             for idx in self.selected_clients_idx:
                 client_loss = self.clientsObj[idx].train()
                 loss_logs.append(client_loss)
+                # compute train accuracy after local training
+                client_train_acc = self.clientsObj[idx].train_accuracy()
+                train_acc_logs.append(client_train_acc)
             self.client_train_loss_logs.append(loss_logs)
+            self.client_train_acc_logs.append(train_acc_logs)
 
             self.receive_models()
             optimal_weight = self.cal_optimal_weight()             # calculate the optimal weight
