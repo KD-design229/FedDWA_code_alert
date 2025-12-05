@@ -1055,6 +1055,115 @@ class GPRAdapter(nn.Module):
         return x + self.scale * self.up_proj(self.act(self.down_proj(x)))
 
 
+class TextEncoder(nn.Module):
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+
+    def forward(self, prompts, tokenized_prompts):
+        x = prompts + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+
+        return x
+
+class PromptLearner(nn.Module):
+    def __init__(self, classnames, clip_model, n_ctx=16, csc=False, class_token_position='end'):
+        super().__init__()
+        n_cls = len(classnames)
+        dtype = clip_model.dtype
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+        
+        if csc:
+            print("Initializing class-specific contexts")
+            ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+        else:
+            print("Initializing a generic context")
+            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+        nn.init.normal_(ctx_vectors, std=0.02)
+        
+        prompt_prefix = " ".join(["X"] * n_ctx)
+        
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        self.ctx = nn.Parameter(ctx_vectors) # to be optimized
+
+        classnames = [name.replace("_", " ") for name in classnames]
+        prompts = [prompt_prefix + " " + name + "." for name in classnames]
+
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts.to(clip_model.device)).type(dtype)
+
+        # Register buffers
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+
+        self.n_cls = n_cls
+        self.n_ctx = n_ctx
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.class_token_position = class_token_position
+        self.csc = csc
+
+    def forward(self):
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            if self.csc:
+                ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+            else:
+                 ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+        
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+
+        if self.class_token_position == "end":
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim)
+                    ctx,     # (n_cls, n_ctx, dim)
+                    suffix,  # (n_cls, *, dim)
+                ],
+                dim=1,
+            )
+        elif self.class_token_position == "middle":
+            half_n_ctx = self.n_ctx // 2
+            prompts = torch.cat(
+                [
+                    prefix,
+                    ctx[:, :half_n_ctx],
+                    suffix[:, : -1 - half_n_ctx],
+                    ctx[:, half_n_ctx:],
+                    suffix[:, -1:],
+                ],
+                dim=1,
+            )
+        elif self.class_token_position == "front":
+            prompts = torch.cat(
+                [
+                    prefix,
+                    suffix[:, : -1 - self.n_ctx],
+                    ctx,
+                    suffix[:, -1:],
+                ],
+                dim=1,
+            )
+        else:
+            raise ValueError
+
+        return prompts
+
+
 class FedCLIP(nn.Module):
     """
     FedCLIP: 冻结 CLIP backbone + 可训练 Adapter
@@ -1063,13 +1172,17 @@ class FedCLIP(nn.Module):
     - gpr_mode=True 时使用 GPR 专用 Adapter
     - GPR 专用的 prompt 模板
     """
-    def __init__(self, model_name='ViT-B/32', device='cuda', num_classes=10, class_names=None, gpr_mode=False):
+    def __init__(self, model_name='ViT-B/32', device='cuda', num_classes=10, class_names=None, gpr_mode=False, use_coop=False, n_ctx=16, csc=False, class_token_position='end'):
         super(FedCLIP, self).__init__()
         if clip is None:
             raise ImportError("Please install clip: pip install git+https://github.com/openai/CLIP.git")
             
         self.device = device
         self.gpr_mode = gpr_mode
+        self.use_coop = use_coop
+        self.n_ctx = n_ctx
+        self.csc = csc
+        self.class_token_position = class_token_position
         
         # Load CLIP model
         # jit=False is often recommended for fine-tuning or when using with other torch modules
@@ -1079,6 +1192,14 @@ class FedCLIP(nn.Module):
         # Freeze parameters
         for param in self.model.parameters():
             param.requires_grad = False
+            
+        # Initialize PromptLearner if use_coop is True
+        if use_coop and class_names:
+             self.prompt_learner = PromptLearner(class_names, self.model, n_ctx=n_ctx, csc=csc, class_token_position=class_token_position)
+             self.text_encoder = TextEncoder(self.model)
+        else:
+             self.prompt_learner = None
+             self.text_encoder = None
             
         # Attention Adapter (from FedMedCLIP)
         # CLIP visual output dim: 512 for ViT-B/32, 768 for ViT-L/14
@@ -1136,6 +1257,14 @@ class FedCLIP(nn.Module):
             
     def set_class_prompts(self, class_names):
         self.class_names = class_names
+        
+        if self.use_coop:
+            if self.prompt_learner is None:
+                 self.prompt_learner = PromptLearner(class_names, self.model, n_ctx=self.n_ctx, csc=self.csc, class_token_position=self.class_token_position)
+                 self.text_encoder = TextEncoder(self.model)
+                 self.prompt_learner.to(self.device)
+                 self.text_encoder.to(self.device)
+            return
         
         # [自定义] GPR 类别描述映射表
         # 为每个类别定义特定的视觉特征描述，增强 CLIP 的理解能力
@@ -1248,14 +1377,23 @@ class FedCLIP(nn.Module):
             
             # [关键修正] 不再使用 gpr_classifier (线性头)，而是使用 Text Features
             # 这样可以利用 CLIP 的 Zero-shot 能力作为强先验，防止过拟合
-            if self.text_features is None:
+            
+            if self.use_coop and self.prompt_learner is not None:
+                prompts = self.prompt_learner()
+                tokenized_prompts = self.prompt_learner.tokenized_prompts
+                text_features = self.text_encoder(prompts, tokenized_prompts)
+                text_features = text_features / text_features.norm(dim=1, keepdim=True)
+            else:
+                text_features = self.text_features
+
+            if text_features is None:
                  if self.training:
                      raise ValueError("Class prompts not set. Call set_class_prompts() first.")
                  return torch.zeros(x.size(0), self.num_classes).to(self.device)
             
             # 计算图像特征与文本特征的相似度
             logit_scale = self.model.logit_scale.exp().float()
-            logits = logit_scale * adapted_features @ self.text_features.t()
+            logits = logit_scale * adapted_features @ text_features.t()
             
         else:
             # 原始模式：使用 attention adapter + text similarity
@@ -1264,7 +1402,15 @@ class FedCLIP(nn.Module):
             image_features = image_features / image_features.norm(dim=1, keepdim=True)
             
             # Classification (Similarity with text features)
-            if self.text_features is None:
+            if self.use_coop and self.prompt_learner is not None:
+                prompts = self.prompt_learner()
+                tokenized_prompts = self.prompt_learner.tokenized_prompts
+                text_features = self.text_encoder(prompts, tokenized_prompts)
+                text_features = text_features / text_features.norm(dim=1, keepdim=True)
+            else:
+                text_features = self.text_features
+
+            if text_features is None:
                  # If no text features, we can't classify. 
                  # For now, raise error or return dummy if just initializing
                  if self.training:
@@ -1273,7 +1419,7 @@ class FedCLIP(nn.Module):
                  
             # [Fix] Convert logit_scale to float32
             logit_scale = self.model.logit_scale.exp().float()
-            logits = logit_scale * image_features @ self.text_features.t()
+            logits = logit_scale * image_features @ text_features.t()
         
         return logits
         
@@ -1284,10 +1430,11 @@ class FedCLIP(nn.Module):
         with torch.no_grad():
             for param in self.fea_attn.parameters():
                 vals.append(copy.deepcopy(param))
-            # [修正] gpr_classifier 不再使用，所以不需要获取它的参数
-            # if self.gpr_mode:
-            #     for param in self.gpr_classifier.parameters():
-            #         vals.append(copy.deepcopy(param))
+            
+            if self.use_coop and self.prompt_learner is not None:
+                for param in self.prompt_learner.parameters():
+                    vals.append(copy.deepcopy(param))
+                    
         return vals
         
     def set_head_val(self, vals):
@@ -1296,11 +1443,11 @@ class FedCLIP(nn.Module):
             for param in self.fea_attn.parameters():
                 param.copy_(vals[i])
                 i += 1
-            # [修正] gpr_classifier 不再使用
-            # if self.gpr_mode:
-            #     for param in self.gpr_classifier.parameters():
-            #         param.copy_(vals[i])
-            #         i += 1
+            
+            if self.use_coop and self.prompt_learner is not None:
+                for param in self.prompt_learner.parameters():
+                    param.copy_(vals[i])
+                    i += 1
                 
     def get_body_val(self):
         # Body is frozen

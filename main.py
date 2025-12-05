@@ -66,6 +66,12 @@ def parse_args():
                         choices=['cnn', 'resnet18', 'mobilevit'],
                         help='Backbone for GPR-FedSense model (cnn, resnet18, mobilevit)')
 
+    # [CoOp Arguments]
+    parser.add_argument('--use_coop', action='store_true', help='Enable CoOp (Context Optimization) for FedCLIP')
+    parser.add_argument('--n_ctx', type=int, default=16, help='Context length for CoOp')
+    parser.add_argument('--csc', action='store_true', help='Enable Class-Specific Context for CoOp')
+    parser.add_argument('--class_token_position', type=str, default='end', choices=['end', 'middle', 'front'], help='Position of class token in CoOp')
+
     parser.add_argument('--data_dir', type=str, default='./data', help='root directory of the dataset')
 
     # dataset
@@ -210,6 +216,11 @@ def run_alg(args):
     elif model_name == 'fedclip':
         # [Added] FedCLIP model
         gpr_mode = getattr(args, 'gpr_mode', False)
+        use_coop = getattr(args, 'use_coop', False)
+        n_ctx = getattr(args, 'n_ctx', 16)
+        csc = getattr(args, 'csc', False)
+        class_token_position = getattr(args, 'class_token_position', 'end')
+
         if args.dataset == 'gpr_custom':
             args.num_classes = 8
         elif args.dataset == 'cifar10tpds':
@@ -218,9 +229,11 @@ def run_alg(args):
             args.num_classes = 100
         
         # Initialize without class names first, they will be set in serverBase after dataset loading
-        modelObj = FedCLIP(model_name='ViT-B/32', device=args.device, num_classes=args.num_classes, gpr_mode=gpr_mode).to(args.device)
+        modelObj = FedCLIP(model_name='ViT-B/32', device=args.device, num_classes=args.num_classes, gpr_mode=gpr_mode, use_coop=use_coop, n_ctx=n_ctx, csc=csc, class_token_position=class_token_position).to(args.device)
         if gpr_mode:
             print("[GPR Mode] FedCLIP 启用 GPR 专用 Adapter 和分类头")
+        if use_coop:
+            print(f"[CoOp Mode] Enabled with n_ctx={n_ctx}, csc={csc}, pos={class_token_position}")
     elif model_name == 'gpr_fed':
         # [Added] GPR-FedSense: 专为探地雷达设计的联邦学习模型
         if args.dataset == 'gpr_custom':
